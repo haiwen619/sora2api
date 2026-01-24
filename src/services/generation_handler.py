@@ -407,7 +407,8 @@ class GenerationHandler:
                                image: Optional[str] = None,
                                video: Optional[str] = None,
                                remix_target_id: Optional[str] = None,
-                               stream: bool = True) -> AsyncGenerator[str, None]:
+                               stream: bool = True,
+                               show_init_message: bool = True) -> AsyncGenerator[str, None]:
         """Handle generation request
 
         Args:
@@ -417,6 +418,7 @@ class GenerationHandler:
             video: Base64 encoded video or video URL
             remix_target_id: Sora share link video ID for remix
             stream: Whether to stream response
+            show_init_message: Whether to show "Generation Process Begins" message
         """
         start_time = time.time()
         log_id = None  # Initialize log_id to avoid reference before assignment
@@ -552,7 +554,7 @@ class GenerationHandler:
                     )
 
             # Generate
-            if stream:
+            if stream and show_init_message:
                 if is_first_chunk:
                     yield self._format_stream_chunk(
                         reasoning_content="**Generation Process Begins**\n\nInitializing generation request...\n",
@@ -767,7 +769,9 @@ class GenerationHandler:
         while retry_count <= max_retries:
             try:
                 # Try generation
-                async for chunk in self.handle_generation(model, prompt, image, video, remix_target_id, stream):
+                # Only show init message on first attempt (not on retries)
+                show_init = (retry_count == 0)
+                async for chunk in self.handle_generation(model, prompt, image, video, remix_target_id, stream, show_init_message=show_init):
                     yield chunk
                 # If successful, return
                 return
