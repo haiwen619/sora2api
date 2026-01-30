@@ -25,6 +25,249 @@ try:
 except ImportError:
     PLAYWRIGHT_AVAILABLE = False
 
+# Global browser instance for reuse (lightweight Playwright approach)
+_browser = None
+_playwright = None
+_current_proxy = None
+
+# Sentinel token cache
+_cached_sentinel_token = None
+_cached_device_id = None
+
+
+async def _get_browser(proxy_url: str = None):
+    """Get or create browser instance (reuses existing browser)"""
+    global _browser, _playwright, _current_proxy
+    
+    # If proxy changed, restart browser
+    if _browser is not None and _current_proxy != proxy_url:
+        await _browser.close()
+        _browser = None
+    
+    if _browser is None:
+        _playwright = await async_playwright().start()
+        launch_args = {
+            'headless': True,
+            'args': [
+                '--no-sandbox',
+                '--disable-gpu',
+                '--disable-dev-shm-usage',
+                '--disable-extensions',
+                '--disable-plugins',
+                '--disable-images',
+                '--disable-default-apps',
+                '--disable-sync',
+                '--disable-translate',
+                '--disable-background-networking',
+                '--disable-software-rasterizer',
+            ]
+        }
+        if proxy_url:
+            launch_args['proxy'] = {'server': proxy_url}
+        _browser = await _playwright.chromium.launch(**launch_args)
+        _current_proxy = proxy_url
+    return _browser
+
+
+async def _close_browser():
+    """Close browser instance"""
+    global _browser, _playwright
+    if _browser:
+        await _browser.close()
+        _browser = None
+    if _playwright:
+        await _playwright.stop()
+        _playwright = None
+
+
+async def _fetch_oai_did(proxy_url: str = None, max_retries: int = 3) -> str:
+    """Fetch oai-did using curl_cffi (lightweight approach)
+    
+    Raises:
+        Exception: If 403 or 429 response received
+    """
+    debug_logger.log_info(f"[Sentinel] Fetching oai-did...")
+    
+    for attempt in range(max_retries):
+        try:
+            async with AsyncSession(impersonate="chrome120") as session:
+                response = await session.get(
+                    "https://chatgpt.com/",
+                    proxy=proxy_url,
+                    timeout=30,
+                    allow_redirects=True
+                )
+                
+                # Check for 403/429 errors - don't retry, just fail
+                if response.status_code == 403:
+                    raise Exception("403 Forbidden - Access denied when fetching oai-did")
+                if response.status_code == 429:
+                    raise Exception("429 Too Many Requests - Rate limited when fetching oai-did")
+                
+                oai_did = response.cookies.get("oai-did")
+                if oai_did:
+                    debug_logger.log_info(f"[Sentinel] oai-did: {oai_did}")
+                    return oai_did
+                
+                set_cookie = response.headers.get("set-cookie", "")
+                match = re.search(r'oai-did=([a-f0-9-]{36})', set_cookie)
+                if match:
+                    oai_did = match.group(1)
+                    debug_logger.log_info(f"[Sentinel] oai-did: {oai_did}")
+                    return oai_did
+                    
+        except Exception as e:
+            error_str = str(e)
+            # Re-raise 403/429 errors immediately
+            if "403" in error_str or "429" in error_str:
+                raise
+            debug_logger.log_info(f"[Sentinel] oai-did fetch failed: {e}")
+        
+        if attempt < max_retries - 1:
+            await asyncio.sleep(2)
+    
+    return None
+
+
+async def _generate_sentinel_token_lightweight(proxy_url: str = None, device_id: str = None) -> str:
+    """Generate sentinel token using lightweight Playwright approach
+    
+    Uses route interception and SDK injection for minimal resource usage.
+    Reuses browser instance across calls.
+    
+    Args:
+        proxy_url: Optional proxy URL
+        device_id: Optional pre-fetched oai-did
+        
+    Returns:
+        Sentinel token string or None on failure
+        
+    Raises:
+        Exception: If 403/429 when fetching oai-did
+    """
+    global _cached_device_id
+    
+    if not PLAYWRIGHT_AVAILABLE:
+        debug_logger.log_info("[Sentinel] Playwright not available")
+        return None
+    
+    # Get oai-did
+    if not device_id:
+        device_id = await _fetch_oai_did(proxy_url)
+    
+    if not device_id:
+        debug_logger.log_info("[Sentinel] Failed to get oai-did")
+        return None
+    
+    _cached_device_id = device_id
+    
+    debug_logger.log_info(f"[Sentinel] Starting browser...")
+    browser = await _get_browser(proxy_url)
+    
+    context = await browser.new_context(
+        viewport={'width': 800, 'height': 600},
+        user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+        bypass_csp=True
+    )
+    
+    # Set cookie
+    await context.add_cookies([{
+        'name': 'oai-did',
+        'value': device_id,
+        'domain': 'sora.chatgpt.com',
+        'path': '/'
+    }])
+    
+    page = await context.new_page()
+    
+    # Route interception - inject SDK
+    inject_html = '''<!DOCTYPE html><html><head><script src="https://chatgpt.com/backend-api/sentinel/sdk.js"></script></head><body></body></html>'''
+    
+    async def handle_route(route):
+        url = route.request.url
+        if "__sentinel__" in url:
+            await route.fulfill(status=200, content_type="text/html", body=inject_html)
+        elif "/sentinel/" in url or "chatgpt.com" in url:
+            await route.continue_()
+        else:
+            await route.abort()
+    
+    await page.route("**/*", handle_route)
+    
+    debug_logger.log_info(f"[Sentinel] Loading SDK...")
+    
+    try:
+        # Load SDK via hack (must be under sora.chatgpt.com domain)
+        await page.goto("https://sora.chatgpt.com/__sentinel__", wait_until="load", timeout=30000)
+        
+        # Wait for SDK to load
+        await page.wait_for_function("typeof SentinelSDK !== 'undefined' && typeof SentinelSDK.token === 'function'", timeout=15000)
+        
+        debug_logger.log_info(f"[Sentinel] Getting token...")
+        
+        # Call SDK
+        token = await page.evaluate(f'''
+            async () => {{
+                try {{
+                    return await SentinelSDK.token('sora_2_create_task', '{device_id}');
+                }} catch (e) {{
+                    return 'ERROR: ' + e.message;
+                }}
+            }}
+        ''')
+        
+        if token and not token.startswith('ERROR'):
+            debug_logger.log_info(f"[Sentinel] Token obtained successfully")
+            return token
+        else:
+            debug_logger.log_info(f"[Sentinel] Token error: {token}")
+            return None
+            
+    except Exception as e:
+        debug_logger.log_info(f"[Sentinel] Error: {e}")
+        return None
+    finally:
+        await context.close()
+
+
+async def _get_cached_sentinel_token(proxy_url: str = None, force_refresh: bool = False) -> str:
+    """Get sentinel token with caching support
+    
+    Args:
+        proxy_url: Optional proxy URL
+        force_refresh: Force refresh token (e.g., after 400 error)
+        
+    Returns:
+        Sentinel token string or None
+        
+    Raises:
+        Exception: If 403/429 when fetching oai-did
+    """
+    global _cached_sentinel_token
+    
+    # Return cached token if available and not forcing refresh
+    if _cached_sentinel_token and not force_refresh:
+        debug_logger.log_info("[Sentinel] Using cached token")
+        return _cached_sentinel_token
+    
+    # Generate new token
+    debug_logger.log_info("[Sentinel] Generating new token...")
+    token = await _generate_sentinel_token_lightweight(proxy_url)
+    
+    if token:
+        _cached_sentinel_token = token
+        debug_logger.log_info("[Sentinel] Token cached successfully")
+    
+    return token
+
+
+def _invalidate_sentinel_cache():
+    """Invalidate cached sentinel token (call after 400 error)"""
+    global _cached_sentinel_token
+    _cached_sentinel_token = None
+    debug_logger.log_info("[Sentinel] Cache invalidated")
+
+
 # PoW related constants
 POW_MAX_ITERATION = 500000
 POW_CORES = [4, 8, 12, 16, 24, 32]
@@ -358,6 +601,14 @@ class SoraClient:
     async def _nf_create_urllib(self, token: str, payload: dict, sentinel_token: str,
                                 proxy_url: Optional[str], token_id: Optional[int] = None,
                                 user_agent: Optional[str] = None) -> Dict[str, Any]:
+        """Make nf/create request
+        
+        Returns:
+            Response dict on success
+            
+        Raises:
+            Exception: With error info, including '400' in message for sentinel token errors
+        """
         url = f"{self.base_url}/nf/create"
         if not user_agent:
             user_agent = random.choice(DESKTOP_USER_AGENTS)
@@ -388,26 +639,6 @@ class SoraClient:
                 response_text=error_str,
                 source="Server"
             )
-            
-            if "400" in error_str or "sentinel" in error_str.lower() or "invalid" in error_str.lower():
-                debug_logger.log_info("Attempting browser fallback for sentinel token...")
-                
-                browser_token = await self._get_sentinel_token_via_browser(proxy_url)
-                
-                if browser_token:
-                    debug_logger.log_info("Got sentinel token from browser, retrying nf/create...")
-                    
-                    browser_data = json.loads(browser_token)
-                    browser_device_id = browser_data.get("id", device_id)
-
-                    headers["OpenAI-Sentinel-Token"] = browser_token
-                    headers["OAI-Device-Id"] = browser_device_id
-                    
-                    result = await asyncio.to_thread(
-                        self._post_json_sync, url, headers, payload, 30, proxy_url
-                    )
-                    return result
-            
             raise
 
     @staticmethod
@@ -798,17 +1029,63 @@ class SoraClient:
         if config.pow_proxy_enabled:
             pow_proxy_url = config.pow_proxy_url or None
 
-        sentinel_token = await self._get_sentinel_token_via_browser(pow_proxy_url)
+        user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+
+        # Try to get cached sentinel token first (using lightweight Playwright approach)
+        try:
+            sentinel_token = await _get_cached_sentinel_token(pow_proxy_url, force_refresh=False)
+        except Exception as e:
+            # 403/429 errors from oai-did fetch - don't retry, just fail
+            error_str = str(e)
+            if "403" in error_str or "429" in error_str:
+                debug_logger.log_error(
+                    error_message=f"Failed to get sentinel token: {error_str}",
+                    status_code=403 if "403" in error_str else 429,
+                    response_text=error_str,
+                    source="Server"
+                )
+                raise
+            sentinel_token = None
 
         if not sentinel_token:
-            # 如果浏览器方式失败，回退到手动 POW
-            debug_logger.log_info("[Warning] Browser sentinel token failed, falling back to manual POW")
+            # Fallback to manual POW if lightweight approach fails
+            debug_logger.log_info("[Warning] Lightweight sentinel token failed, falling back to manual POW")
             sentinel_token, user_agent = await self._generate_sentinel_token(token)
-        else:
-            user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
-        
-        result = await self._nf_create_urllib(token, json_data, sentinel_token, proxy_url, token_id, user_agent)
-        return result["id"]
+
+        # First attempt with cached/generated token
+        try:
+            result = await self._nf_create_urllib(token, json_data, sentinel_token, proxy_url, token_id, user_agent)
+            return result["id"]
+        except Exception as e:
+            error_str = str(e)
+            
+            # Check if it's a 400 error (sentinel token invalid)
+            if "400" in error_str or "sentinel" in error_str.lower() or "invalid" in error_str.lower():
+                debug_logger.log_info("[Sentinel] Got 400 error, refreshing token and retrying...")
+                
+                # Invalidate cache and get fresh token
+                _invalidate_sentinel_cache()
+                
+                try:
+                    sentinel_token = await _get_cached_sentinel_token(pow_proxy_url, force_refresh=True)
+                except Exception as refresh_e:
+                    # 403/429 errors - don't continue
+                    error_str = str(refresh_e)
+                    if "403" in error_str or "429" in error_str:
+                        raise refresh_e
+                    sentinel_token = None
+                
+                if not sentinel_token:
+                    # Fallback to manual POW
+                    debug_logger.log_info("[Warning] Refresh failed, falling back to manual POW")
+                    sentinel_token, user_agent = await self._generate_sentinel_token(token)
+                
+                # Retry with fresh token
+                result = await self._nf_create_urllib(token, json_data, sentinel_token, proxy_url, token_id, user_agent)
+                return result["id"]
+            
+            # For other errors, just re-raise
+            raise
     
     async def get_image_tasks(self, token: str, limit: int = 20, token_id: Optional[int] = None) -> Dict[str, Any]:
         """Get recent image generation tasks"""
