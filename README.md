@@ -600,3 +600,31 @@ for line in response.iter_lines():
 ## Star History
 
 [![Star History Chart](https://api.star-history.com/svg?repos=TheSmallHanCat/sora2api&type=date&legend=top-left)](https://www.star-history.com/#TheSmallHanCat/sora2api&type=date&legend=top-left)
+
+
+@thien 你在写注册机啊
+ https://chatgpt.com/api/auth/csrf
+作用：拿 CSRF token。
+用途：后续请求都要带这个 token，防止跨站伪造，属于安全校验。
+2. https://chatgpt.com/api/auth/signin/openai?...&ext-oai-did={device_id}&auth_session_logging_id={loggin_id}
+作用：在 ChatGPT 侧“发起用 OpenAI 登录”这一步。
+用途：带上 device_id、auth_session_logging_id 等，建立会话、拿到跳转到 auth.openai.com 的授权链接或状态。
+3. https://auth.openai.com/api/accounts/authorize/continue
+作用：在 OpenAI 登录/授权页点“继续”时调用的接口。
+用途：确认当前授权会话、决定下一步是登录还是注册（例如跳到注册或邮箱验证）。
+4. https://auth.openai.com/api/accounts/user/register
+作用：表示“我要走注册流程”（注册入口）。
+用途：告诉服务端走注册分支，而不是已有账号登录。
+5. https://auth.openai.com/api/accounts/email-otp/send
+作用：发送邮箱验证码（OTP）。
+用途：向用户邮箱发一封带验证码的邮件，用于验证邮箱归属。
+6. https://auth.openai.com/api/accounts/email-otp/validate
+作用：校验用户输入的邮箱验证码。
+用途：把用户填的验证码发给服务端，验证通过后才允许继续注册。
+7. https://auth.openai.com/api/accounts/create_account
+作用：真正创建账号。
+用途：在邮箱验证通过后，用这里提交邮箱、密码等信息完成账号创建。
+8. response.json()['continue_url']
+作用：某一步接口在响应里返回的“下一步地址”。
+用途：前端/脚本根据这个 URL 做跳转或发下一次请求，保证按服务端要求的顺序走完流程（例如：验证完邮箱后跳到设置密码或完成页）。
+
